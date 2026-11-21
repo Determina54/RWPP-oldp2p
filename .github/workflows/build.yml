@@ -1,0 +1,184 @@
+#
+# Copyright 2023-2025 RWPP contributors
+# 此源代码的使用受 GNU AFFERO GENERAL PUBLIC LICENSE version 3 许可证的约束, 可以在以下链接找到该许可证.
+# Use of this source code is governed by the GNU AGPLv3 license that can be found through the following link.
+# https://github.com/Minxyzgo/RWPP/blob/main/LICENSE
+#
+
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-desktop:
+    name: Build desktop uber jar
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out RWPP
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # rwpp-core is a Kotlin Multiplatform module with an Android target, so the
+      # Android plugin resolves the SDK during configuration even when only the
+      # desktop task runs. Without the SDK, every Gradle invocation fails early.
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The legacy "tools" package was removed from Google's SDK repository.
+          # Leaving the action's default packages installs it, sdkmanager exits 1,
+          # and every later build step is skipped.
+          packages: platform-tools
+
+      - name: Install the Android SDK packages the build declares
+        shell: bash
+        run: |
+          set -euo pipefail
+          # android.compileSdk=35 and buildToolsVersion=34.0.0 come from
+          # gradle.properties and rwpp-core/build.gradle.kts. Installing exactly
+          # those keeps CI honest about what a local build needs.
+          sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
+      - name: Set up Gradle with dependency caching
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Build the desktop uber jar
+        shell: bash
+        env:
+          # GitHub's hosted runners share outbound IPs, so Maven Central
+          # intermittently answers 429 Too Many Requests, and the JetBrains
+          # Compose repository occasionally fails DNS mid-build. Both abort
+          # dependency resolution inside settings.gradle.kts (the foojay
+          # plugin's gson dependency) before any task runs. Retries with
+          # backoff plus generous timeouts turn those transient errors into
+          # a slow but successful resolve.
+          GRADLE_OPTS: >-
+            -Dorg.gradle.internal.repository.max.retries=6
+            -Dorg.gradle.internal.repository.initial.backoff=2000
+            -Dorg.gradle.internal.http.connectionTimeout=120000
+            -Dorg.gradle.internal.http.socketTimeout=120000
+        run: |
+          set -euo pipefail
+          # Gradle keeps trying the remaining repositories when one fails, so
+          # appending a mirror that actually serves Maven Central is enough to
+          # route around both the 429 and the dead DNS entry. Injected through
+          # an init script so no tracked build file changes. Two mirrors are
+          # listed because they fail independently (regional restrictions).
+          cat > "$RUNNER_TEMP/central-mirror.init.gradle" <<'INIT'
+          beforeSettings { settings ->
+              def mirrors = [
+                  'https://maven-central.storage-download.googleapis.com/maven2/',
+                  'https://maven.aliyun.com/repository/central',
+              ]
+              mirrors.each { m ->
+                  settings.pluginManagement.repositories.maven { url = m }
+                  settings.dependencyResolutionManagement.repositories.maven { url = m }
+              }
+          }
+          allprojects {
+              buildscript.repositories.maven { url = 'https://maven-central.storage-download.googleapis.com/maven2/' }
+              buildscript.repositories.maven { url = 'https://maven.aliyun.com/repository/central' }
+              repositories.maven { url = 'https://maven-central.storage-download.googleapis.com/maven2/' }
+              repositories.maven { url = 'https://maven.aliyun.com/repository/central' }
+          }
+          INIT
+          # Games libs are tracked in lib/ and are compileOnly for desktop, so no
+          # external download is needed. Android app packaging is intentionally
+          # skipped: rwpp-android/src/main/{res,assets} are gitignored and absent.
+          ./gradlew --no-daemon --stacktrace \
+            --init-script "$RUNNER_TEMP/central-mirror.init.gradle" \
+            :rwpp-desktop:packageReleaseUberJarForCurrentOS
+      - name: Collect assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # The project version lives in the root build.gradle.kts and is what
+          # compose.desktop uses as packageVersion. Strip any CR so a checkout
+          # configured with core.autocrlf=true still parses.
+          VERSION="$(sed -n 's/^version = "\(.*\)"\r\?$/\1/p' build.gradle.kts | head -n1)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not read the project version from build.gradle.kts"
+            exit 1
+          fi
+          echo "Building RWPP $VERSION"
+          JARS=()
+          mapfile -t JARS < <(
+            find rwpp-desktop/build/compose/jars -maxdepth 1 -type f -name '*.jar' 2>/dev/null || true
+          )
+          if [ "${#JARS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one uber jar, found ${#JARS[@]}: ${JARS[*]:-none}"
+            # Print the layout so a renamed Compose output path is easy to fix.
+            find rwpp-desktop/build/compose -maxdepth 3 -type d 2>/dev/null || true
+            exit 1
+          fi
+          echo "Uber jar: ${JARS[0]}"
+          cp "${JARS[0]}" "release-assets/RWPP-${VERSION}.jar"
+          # The uber jar excludes the compileOnly game jars; the launchers are
+          # shipped alongside it so the expected layout is unambiguous.
+          cp launcher.bat launcher.sh release-assets/
+          chmod +x release-assets/launcher.sh
+          (
+            cd release-assets
+            sha256sum ./* > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          )
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rwpp-desktop-${{ github.sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Attach assets to the release
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'release' && github.event.action == 'published')
+    needs: build-desktop
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rwpp-desktop-${{ github.sha }}
+          path: release-assets
+
+      - name: Attach assets to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "RWPP $TAG" \
+              --notes "Automated build for $TAG"
+          fi
